@@ -171,24 +171,15 @@ func (b *Base) EvaluateFetchedConfig(ctx context.Context, prctx pull.Context, cl
 	// The pull.Context is not thread-safe, so this ensures a single API call
 	// to GET /repos/:owner/:repo/pulls/:number/files and populates the cache
 	// before concurrent access.
-	changedFiles, err := prctx.ChangedFiles()
+	_, err = prctx.ChangedFiles()
 	if err != nil {
 		return errors.Wrap(err, "failed to list pull request files")
 	}
 
-	// Pre-filter workspaces: skip those whose working directory and trigger
-	// prefixes don't match the changed files. This avoids unnecessary TFE API
-	// calls and goroutine overhead for irrelevant workspaces.
-	baseBranch, _ := prctx.Branches()
-	relevantWorkspaces := plan.FilterRelevantWorkspaces(fetchedConfig.Config, baseBranch, prctx.DefaultBranch(), changedFiles)
-
-	logger.Debug().Msgf("Filtered %d/%d workspaces as relevant based on changed files",
-		len(relevantWorkspaces), len(fetchedConfig.Config.Workspaces))
-
 	var wg sync.WaitGroup
 	var evaluationFailures uint32
-	for i := range relevantWorkspaces {
-		wkcfg := relevantWorkspaces[i]
+	for i := range fetchedConfig.Config.Workspaces {
+		wkcfg := fetchedConfig.Config.Workspaces[i]
 
 		wg.Add(1)
 
