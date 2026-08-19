@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,7 @@ import (
 const (
 	DefaultPolicyPath         = ".tfe-plan.yml"
 	DefaultStatusCheckContext = "TFE"
+	DefaultStatusDebounce     = 10 * time.Second
 
 	LogKeyGitHubSHA = "github_sha"
 )
@@ -56,6 +58,14 @@ type Base struct {
 	HTTPClient        *http.Client
 	PullOpts          *PullEvaluationOptions
 
+	// StatusDebounce coalesces evaluations triggered indirectly by status
+	// and check_run events, so that a burst of unrelated CI checks
+	// completing for the same commit does not each cause a full,
+	// independent GitHub API evaluation of every open PR on that commit.
+	// It is not consulted for evaluations triggered directly by user
+	// action (opening/updating a PR, commenting, etc).
+	StatusDebounce *Debouncer
+
 	AppName string
 }
 
@@ -65,6 +75,13 @@ type PullEvaluationOptions struct {
 	// StatusCheckContext will be used to create the status context. It will be used in the following
 	// pattern: <StatusCheckContext>/<TFE Organization Name>/<TFE Workspace Name>
 	StatusCheckContext string `yaml:"status_check_context"`
+
+	// StatusDebounce is the minimum time between evaluations of the same PR
+	// that are triggered indirectly, by a "status" or "check_run" webhook
+	// event for some other, unrelated CI check succeeding. It does not
+	// affect evaluations triggered directly by user action such as opening
+	// a PR or commenting. Set to "0s" to disable debouncing entirely.
+	StatusDebounce time.Duration `yaml:"status_debounce"`
 
 	// This field is unused but is left to avoid breaking configuration files:
 	// yaml.UnmarshalStrict returns an error for unmapped fields
@@ -81,28 +98,56 @@ func (p *PullEvaluationOptions) FillDefaults() {
 	if p.StatusCheckContext == "" {
 		p.StatusCheckContext = DefaultStatusCheckContext
 	}
+
+	if p.StatusDebounce == 0 {
+		p.StatusDebounce = DefaultStatusDebounce
+	}
 }
 
 func (b *Base) PostStatus(ctx context.Context, prctx pull.Context, wkcfg plan.WorkspaceConfig, runID string, client *github.Client, state, message string) error {
 	owner := prctx.RepositoryOwner()
 	repo := prctx.RepositoryName()
 	sha := prctx.HeadSHA()
+	statusContext := b.statusCheckContext(wkcfg)
+
+	var targetURL string
+	if runID != "" {
+		targetURL = b.targetURL(wkcfg, runID)
+	}
+
+	// Skip the write entirely if the status we are about to post is
+	// identical to what is already on the commit. The bot can be
+	// re-evaluated many times for the same, unchanged commit - a burst of
+	// unrelated commits/reviews/checks on the same PR each cause a full
+	// workspace sweep - and most of those re-evaluations produce exactly
+	// the same result as before. Without this check, every one of them
+	// still pays for a fresh POST /repos/:owner/:repo/statuses/:sha, which
+	// is by far the most expensive call this bot makes (roughly 1s each,
+	// since writing a status invalidates the commit's combined-status
+	// rollup and fans out webhooks to every subscriber - including this
+	// bot itself). This check costs nothing extra: LatestDetailedStatuses
+	// is already fetched and cached once per evaluation round.
+	existing, err := prctx.LatestDetailedStatuses()
+	if err != nil {
+		return errors.Wrap(err, "failed to check existing status before posting")
+	}
+	if current, ok := existing[statusContext]; ok {
+		if current.GetState() == state && current.GetDescription() == message && current.GetTargetURL() == targetURL {
+			zerolog.Ctx(ctx).Debug().Msgf("Status %q on %s is already up to date, skipping write", statusContext, sha)
+			return nil
+		}
+	}
 
 	status := &github.RepoStatus{
-		Context:     github.String(b.statusCheckContext(wkcfg)),
+		Context:     github.String(statusContext),
 		State:       &state,
 		Description: &message,
 	}
-
-	if runID != "" {
-		status.TargetURL = github.String(b.targetURL(wkcfg, runID))
+	if targetURL != "" {
+		status.TargetURL = github.String(targetURL)
 	}
 
-	if err := b.postGitHubRepoStatus(ctx, client, owner, repo, sha, status); err != nil {
-		return err
-	}
-
-	return nil
+	return b.postGitHubRepoStatus(ctx, client, owner, repo, sha, status)
 }
 
 func (b *Base) postGitHubRepoStatus(ctx context.Context, client *github.Client, owner, repo, ref string, status *github.RepoStatus) error {
@@ -129,7 +174,42 @@ func (b *Base) PreparePRContext(ctx context.Context, installationID int64, pr *g
 	return ctx, logger
 }
 
+// IsSelf reports whether the given webhook event sender is this bot's own
+// GitHub App bot user.
+//
+// The comparison is case-insensitive and also checks the sender type,
+// because GitHub logins are case-insensitive and a case-sensitive or
+// type-blind comparison here can silently fail to recognize the bot's own
+// writes. That failure mode is exactly what turns a routine status update
+// into a self-sustaining loop: the bot posts a status, fails to recognize
+// its own webhook echo, treats it as a third party overwriting the status,
+// and posts another one - which is delivered back and repeats. This check
+// must be called before any other processing of an event, not just inside
+// one branch of it, so that no code path can mistake the bot's own output
+// for external input.
+func (b *Base) IsSelf(sender *github.User) bool {
+	if sender == nil {
+		return false
+	}
+	if sender.GetType() != "Bot" {
+		return false
+	}
+	return strings.EqualFold(sender.GetLogin(), b.AppName+"[bot]")
+}
+
 func (b *Base) Evaluate(ctx context.Context, installationID int64, trigger common.Trigger, loc pull.Locator) error {
+	// Evaluations triggered by "status"/"check_run" events happen because
+	// some unrelated CI check changed, not because the PR itself changed.
+	// A burst of such events for the same commit (e.g. several CI jobs
+	// finishing within seconds of each other) would otherwise each cause an
+	// independent, full GitHub API evaluation of the PR. Debounce these so
+	// only one evaluation runs per window; evaluations triggered directly by
+	// user action are never debounced.
+	if trigger == common.TriggerStatus && b.StatusDebounce != nil && !b.StatusDebounce.Allow(loc.Owner, loc.Repo, loc.Number) {
+		zerolog.Ctx(ctx).Debug().Msgf("Skipping status-triggered evaluation of %s/%s#%d, debounced", loc.Owner, loc.Repo, loc.Number)
+		return nil
+	}
+
 	client, err := b.NewInstallationClient(installationID)
 	if err != nil {
 		return err
@@ -346,4 +426,3 @@ func selectionToReviewersRequest(s reviewer.Selection) github.ReviewersRequest {
 
 	return req
 }
-
